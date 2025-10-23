@@ -3,31 +3,29 @@ import matplotlib.pyplot as plt
 import numpy as np
 import time
 
-def pull_gossip(num_nodes, trials=5):
+def pull_gossip(num_nodes, trials=5, base_seed=12345):
     """
-    Pull-based gossip algorithm (push=False, pull=True)
-    Each uninfected node pulls from one random node per round
+    Standard PULL gossip algorithm
+    Each uninfected node contacts one uniform-random peer from all nodes
     """
     results = []
+    random.seed(base_seed)
     
     for trial in range(trials):
-        infected = set()
-        rounds = 0
+        random.seed(base_seed + trial)
         
-        # Start with 1 infected node (state I)
-        infected.add(random.randint(0, num_nodes - 1))
+        infected = {random.randrange(num_nodes)}  # one random source
+        rounds = 0
         
         # Loop until all nodes are infected
         while len(infected) < num_nodes:
             rounds += 1
             new_infected = set()
             
-            # PULL: Each uninfected node requests update from a random peer
+            # PULL: Each uninfected node contacts a uniform-random peer
             for node in range(num_nodes):
                 if node not in infected:
-                    # Select random peer to pull from
-                    peer = random.randint(0, num_nodes - 1)
-                    # If peer is infected, this node becomes infected
+                    peer = random.randrange(num_nodes)  # may be self or uninfected
                     if peer in infected:
                         new_infected.add(node)
             
@@ -106,7 +104,7 @@ for i, (nodes, rounds) in enumerate(zip(node_counts_list, avg_rounds)):
 plt.tight_layout()
 plt.savefig('/Users/negin/UML/Gossip/pull_gossip_plot.png', dpi=300, bbox_inches='tight')
 print("Plot saved as 'pull_gossip_plot.png'")
-plt.show()
+plt.close()
 
 # Summary
 print("\n" + "=" * 50)
