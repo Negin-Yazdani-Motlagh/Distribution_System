@@ -31,7 +31,7 @@ BASE_SEED = 42                          # Reproducibility
 # SIMULATION
 # ============================================================================
 
-def simulate_la_push(n, tau, q, seed):
+def simulate_la_push(n, tau, q, seed, debug=False):
     """
     Simulate one LA-Push epidemic with time-threshold predictor.
     
@@ -45,6 +45,8 @@ def simulate_la_push(n, tau, q, seed):
         Predictor accuracy (0 to 1)
     seed : int
         Random seed
+    debug : bool, optional
+        If True and q=0, print debug information (default: False)
         
     Returns
     -------
@@ -108,26 +110,28 @@ def simulate_la_push(n, tau, q, seed):
                     new_infections.add(target)
             
             # Bad pushes: aim at informed nodes (no new infections)
-            # Fallback: if predictor produced zero new infections, use uniform push
-            # to guarantee progress (otherwise epidemic can stall with q < 1)
-            if len(new_infections) == 0 and num_uninformed > 0:
-                # Use uniform push from all infected nodes
-                targets = rng.integers(0, n - 1, size=num_infected)
-                for i in range(num_infected):
-                    if targets[i] >= infected_indices[i]:
-                        targets[i] += 1
-                for target in targets:
-                    if not infected[target]:
-                        new_infections.add(target)
-                
-                # Ultimate fallback: if still no infections (very unlucky collisions),
-                # infect one random uninformed node to guarantee progress
-                if len(new_infections) == 0:
-                    new_infections.add(rng.choice(uninformed_indices))
+            # With q < 1, predictor can produce zero infections (stalled epidemic)
+            # This is theoretically correct behavior - the epidemic may never finish
+        
+        # Check for stalled epidemic (no new infections in predictor phase)
+        if len(new_infections) == 0:
+            if debug and q == 0.0:
+                print(f"[DEBUG] q=0 STALLED at round {rounds} with {num_infected}/{n} infected")
+                print(f"[DEBUG SUMMARY] q=0 epidemic stalled (infinite rounds) — tau={tau}")
+            # Return -1 to indicate the epidemic stalled (infinite rounds)
+            return -1
         
         # Synchronous update: activate new infections at start of next round
         for node in new_infections:
             infected[node] = True
+        
+        # Debug output for q=0 case
+        if debug and q == 0.0 and rounds % 3 == 0:
+            print(f"[DEBUG] q=0 run — tau={tau}, round={rounds}, num_infected={num_infected}, new_infections={len(new_infections)}")
+    
+    # Debug summary
+    if debug and q == 0.0:
+        print(f"[DEBUG SUMMARY] q=0 finished in {rounds} rounds (tau={tau}) — final infected={infected.sum()} / {n}")
     
     return rounds
 
@@ -182,19 +186,31 @@ def run_q_sweep():
             rounds_list = rounds_results[idx:idx + TRIALS]
             idx += TRIALS
             
-            # Compute statistics
+            # Filter out stalled epidemics (-1 values)
             rounds_arr = np.array(rounds_list)
-            mean_rounds = rounds_arr.mean()
-            std_rounds = rounds_arr.std(ddof=1)
+            successful = rounds_arr[rounds_arr > 0]
+            num_stalled = np.sum(rounds_arr == -1)
             
-            # 95% CI using Student's t
-            t_crit = stats.t.ppf(0.975, df=TRIALS - 1)
-            margin = t_crit * std_rounds / np.sqrt(TRIALS)
-            ci_low = mean_rounds - margin
-            ci_high = mean_rounds + margin
-            
-            median_rounds = np.median(rounds_arr)
-            p90_rounds = np.percentile(rounds_arr, 90)
+            # Compute statistics only on successful runs
+            if len(successful) > 0:
+                mean_rounds = successful.mean()
+                if len(successful) > 1:
+                    std_rounds = successful.std(ddof=1)
+                    t_crit = stats.t.ppf(0.975, df=len(successful) - 1)
+                    margin = t_crit * std_rounds / np.sqrt(len(successful))
+                else:
+                    margin = 0
+                ci_low = mean_rounds - margin
+                ci_high = mean_rounds + margin
+                median_rounds = np.median(successful)
+                p90_rounds = np.percentile(successful, 90)
+            else:
+                # All trials stalled (infinite rounds)
+                mean_rounds = np.inf
+                ci_low = np.inf
+                ci_high = np.inf
+                median_rounds = np.inf
+                p90_rounds = np.inf
             
             results.append({
                 'tau': tau,
@@ -203,7 +219,9 @@ def run_q_sweep():
                 'ci_low': ci_low,
                 'ci_high': ci_high,
                 'median': median_rounds,
-                'p90': p90_rounds
+                'p90': p90_rounds,
+                'num_stalled': num_stalled,
+                'num_successful': len(successful)
             })
     
     return pd.DataFrame(results)
@@ -244,19 +262,31 @@ def run_tau_sweep():
             rounds_list = rounds_results[idx:idx + TRIALS]
             idx += TRIALS
             
-            # Compute statistics
+            # Filter out stalled epidemics (-1 values)
             rounds_arr = np.array(rounds_list)
-            mean_rounds = rounds_arr.mean()
-            std_rounds = rounds_arr.std(ddof=1)
+            successful = rounds_arr[rounds_arr > 0]
+            num_stalled = np.sum(rounds_arr == -1)
             
-            # 95% CI using Student's t
-            t_crit = stats.t.ppf(0.975, df=TRIALS - 1)
-            margin = t_crit * std_rounds / np.sqrt(TRIALS)
-            ci_low = mean_rounds - margin
-            ci_high = mean_rounds + margin
-            
-            median_rounds = np.median(rounds_arr)
-            p90_rounds = np.percentile(rounds_arr, 90)
+            # Compute statistics only on successful runs
+            if len(successful) > 0:
+                mean_rounds = successful.mean()
+                if len(successful) > 1:
+                    std_rounds = successful.std(ddof=1)
+                    t_crit = stats.t.ppf(0.975, df=len(successful) - 1)
+                    margin = t_crit * std_rounds / np.sqrt(len(successful))
+                else:
+                    margin = 0
+                ci_low = mean_rounds - margin
+                ci_high = mean_rounds + margin
+                median_rounds = np.median(successful)
+                p90_rounds = np.percentile(successful, 90)
+            else:
+                # All trials stalled (infinite rounds)
+                mean_rounds = np.inf
+                ci_low = np.inf
+                ci_high = np.inf
+                median_rounds = np.inf
+                p90_rounds = np.inf
             
             results.append({
                 'q': q,
@@ -265,7 +295,9 @@ def run_tau_sweep():
                 'ci_low': ci_low,
                 'ci_high': ci_high,
                 'median': median_rounds,
-                'p90': p90_rounds
+                'p90': p90_rounds,
+                'num_stalled': num_stalled,
+                'num_successful': len(successful)
             })
     
     return pd.DataFrame(results)
@@ -285,18 +317,24 @@ def plot_rounds_vs_q(df):
     colors = plt.cm.viridis(np.linspace(0, 1, len(TAUS)))
     
     for i, tau in enumerate(TAUS):
-        subset = df[df['tau'] == tau]
-        q_vals = subset['q'].values
-        means = subset['mean'].values
-        ci_lows = subset['ci_low'].values
-        ci_highs = subset['ci_high'].values
+        subset = df[df['tau'] == tau].copy()
         
-        # Plot line
-        ax.plot(q_vals, means, marker='o', label=f'τ = {tau}', 
-                color=colors[i], linewidth=2, markersize=6)
+        # Filter out infinite values (stalled epidemics)
+        finite_mask = np.isfinite(subset['mean'])
+        subset_finite = subset[finite_mask]
         
-        # Shaded CI
-        ax.fill_between(q_vals, ci_lows, ci_highs, alpha=0.2, color=colors[i])
+        if len(subset_finite) > 0:
+            q_vals = subset_finite['q'].values
+            means = subset_finite['mean'].values
+            ci_lows = subset_finite['ci_low'].values
+            ci_highs = subset_finite['ci_high'].values
+            
+            # Plot line
+            ax.plot(q_vals, means, marker='o', label=f'τ = {tau}', 
+                    color=colors[i], linewidth=2, markersize=6)
+            
+            # Shaded CI
+            ax.fill_between(q_vals, ci_lows, ci_highs, alpha=0.2, color=colors[i])
     
     ax.set_xlabel('Predictor Accuracy (q)', fontsize=12, fontweight='bold')
     ax.set_ylabel('Rounds to Full Infection', fontsize=12, fontweight='bold')
@@ -305,6 +343,13 @@ def plot_rounds_vs_q(df):
     ax.legend(loc='best', framealpha=0.9)
     ax.grid(True, alpha=0.3)
     ax.set_xlim(-0.05, 1.05)
+    
+    # Add note about q=0 stalling
+    num_stalled_q0 = df[(df['q'] == 0.0) & (df['num_stalled'] > 0)]['num_stalled'].sum()
+    if num_stalled_q0 > 0:
+        ax.text(0.02, 0.98, 'Note: q=0 epidemics stall (infinite rounds)', 
+                transform=ax.transAxes, fontsize=9, verticalalignment='top',
+                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
     
     plt.tight_layout()
     plt.savefig('la_push_rounds_vs_q.png', dpi=300, bbox_inches='tight')
@@ -324,18 +369,24 @@ def plot_rounds_vs_tau(df):
     colors = plt.cm.plasma(np.linspace(0.2, 0.9, len(Q_SLICES)))
     
     for i, q in enumerate(Q_SLICES):
-        subset = df[df['q'] == q]
-        tau_vals = subset['tau'].values
-        means = subset['mean'].values
-        ci_lows = subset['ci_low'].values
-        ci_highs = subset['ci_high'].values
+        subset = df[df['q'] == q].copy()
         
-        # Plot line
-        ax.plot(tau_vals, means, marker='s', label=f'q = {q:.1f}', 
-                color=colors[i], linewidth=2, markersize=7)
+        # Filter out infinite values (stalled epidemics)
+        finite_mask = np.isfinite(subset['mean'])
+        subset_finite = subset[finite_mask]
         
-        # Shaded CI
-        ax.fill_between(tau_vals, ci_lows, ci_highs, alpha=0.2, color=colors[i])
+        if len(subset_finite) > 0:
+            tau_vals = subset_finite['tau'].values
+            means = subset_finite['mean'].values
+            ci_lows = subset_finite['ci_low'].values
+            ci_highs = subset_finite['ci_high'].values
+            
+            # Plot line
+            ax.plot(tau_vals, means, marker='s', label=f'q = {q:.1f}', 
+                    color=colors[i], linewidth=2, markersize=7)
+            
+            # Shaded CI
+            ax.fill_between(tau_vals, ci_lows, ci_highs, alpha=0.2, color=colors[i])
     
     ax.set_xlabel('Time Threshold (τ)', fontsize=12, fontweight='bold')
     ax.set_ylabel('Rounds to Full Infection', fontsize=12, fontweight='bold')
@@ -361,26 +412,37 @@ def print_best_tau_summary(df_tau):
     """
     Print a summary table of best tau for each q in Q_SLICES.
     """
-    print("\n" + "="*60)
+    print("\n" + "="*70)
     print("BEST TAU FOR EACH PREDICTOR ACCURACY")
-    print("="*60)
-    print(f"{'q':<8} {'Best tau':<10} {'Mean Rounds':<15} {'95% CI':<20}")
-    print("-"*60)
+    print("="*70)
+    print(f"{'q':<8} {'Best tau':<10} {'Mean Rounds':<15} {'95% CI':<25} {'Status':<15}")
+    print("-"*70)
     
     for q in Q_SLICES:
-        subset = df_tau[df_tau['q'] == q]
-        best_idx = subset['mean'].idxmin()
-        best_row = subset.loc[best_idx]
+        subset = df_tau[df_tau['q'] == q].copy()
         
-        best_tau = int(best_row['tau'])
-        best_mean = best_row['mean']
-        ci_low = best_row['ci_low']
-        ci_high = best_row['ci_high']
+        # Filter finite values
+        finite_subset = subset[np.isfinite(subset['mean'])]
         
-        print(f"{q:<8.1f} {best_tau:<10} {best_mean:<15.2f} "
-              f"[{ci_low:.2f}, {ci_high:.2f}]")
+        if len(finite_subset) > 0:
+            best_idx = finite_subset['mean'].idxmin()
+            best_row = finite_subset.loc[best_idx]
+            
+            best_tau = int(best_row['tau'])
+            best_mean = best_row['mean']
+            ci_low = best_row['ci_low']
+            ci_high = best_row['ci_high']
+            num_stalled = int(best_row['num_stalled'])
+            
+            status = "OK" if num_stalled == 0 else f"{num_stalled} stalled"
+            
+            print(f"{q:<8.1f} {best_tau:<10} {best_mean:<15.2f} "
+                  f"[{ci_low:.2f}, {ci_high:.2f}]    {status:<15}")
+        else:
+            print(f"{q:<8.1f} {'N/A':<10} {'inf':<15} "
+                  f"{'N/A':<25} {'All stalled':<15}")
     
-    print("="*60 + "\n")
+    print("="*70 + "\n")
 
 
 # ============================================================================
@@ -399,16 +461,41 @@ def main():
     print(f"Base seed:             {BASE_SEED}")
     print("="*70 + "\n")
     
+    # Debug check for q=0 case
+    print("Running debug check for q=0 (tau=0)...")
+    simulate_la_push(200, tau=0, q=0.0, seed=42, debug=True)
+    print()
+    
     # Run experiments
     print("Running Q sweep (rounds vs q for each tau)...")
     df_q = run_q_sweep()
     df_q.to_csv('la_push_rounds_vs_q.csv', index=False)
-    print("+ Saved la_push_rounds_vs_q.csv\n")
+    print("+ Saved la_push_rounds_vs_q.csv")
+    
+    # Report stalled configurations
+    total_stalled = df_q['num_stalled'].sum()
+    if total_stalled > 0:
+        stalled_configs = df_q[df_q['num_stalled'] > 0][['tau', 'q', 'num_stalled']]
+        print(f"\nWARNING: {int(total_stalled)} trial(s) stalled (infinite rounds)")
+        print("Stalled configurations:")
+        for _, row in stalled_configs.iterrows():
+            print(f"  tau={int(row['tau'])}, q={row['q']:.1f}: {int(row['num_stalled'])}/{TRIALS} trials stalled")
+    print()
     
     print("Running tau sweep (rounds vs tau for each q)...")
     df_tau = run_tau_sweep()
     df_tau.to_csv('la_push_rounds_vs_tau.csv', index=False)
-    print("+ Saved la_push_rounds_vs_tau.csv\n")
+    print("+ Saved la_push_rounds_vs_tau.csv")
+    
+    # Report stalled configurations
+    total_stalled_tau = df_tau['num_stalled'].sum()
+    if total_stalled_tau > 0:
+        stalled_configs_tau = df_tau[df_tau['num_stalled'] > 0][['tau', 'q', 'num_stalled']]
+        print(f"\nWARNING: {int(total_stalled_tau)} trial(s) stalled (infinite rounds)")
+        print("Stalled configurations:")
+        for _, row in stalled_configs_tau.iterrows():
+            print(f"  tau={int(row['tau'])}, q={row['q']:.1f}: {int(row['num_stalled'])}/{TRIALS} trials stalled")
+    print()
     
     # Generate plots
     print("Generating plots...")
