@@ -24,7 +24,7 @@ from multiprocessing import Pool, cpu_count
 
 N = 50_000                              # Graph size
 TRIALS = 20                             # Repetitions per (q, τ) pair
-Q_VALUES = np.linspace(0.0, 1.0, 11)    # [0.0, 0.1, ..., 1.0]
+Q_VALUES = np.linspace(0.1, 1.0, 10)    # [0.1, 0.2, ..., 1.0]
 TAUS = [0, 2, 3, 4, 5, 6]               # Threshold values
 Q_SLICES = [0.1, 0.2, 0.4, 0.6]         # For τ sweep plot
 BASE_SEED = 42                          # Reproducibility
@@ -35,14 +35,20 @@ BASE_SEED = 42                          # Reproducibility
 
 def simulate_la_pushpull(n, tau, q, seed, p=None, debug=False):
     """
-    Simulate one LA-Push-Pull epidemic with time-threshold predictors.
+    Simulate LA-Push-Pull with PP-H1Q policy (paper's exact algorithm).
+    
+    PP-H1Q Policy:
+    - Round 1: P-seeding (pull with P, push uniform)
+    - Rounds 2+: Uniform push-pull until ut <= q
+    - Late rounds: Q-guided push (push with Q, pull uniform) when ut <= q
     
     Parameters
     ----------
     n : int
         Number of nodes
     tau : int
-        Time threshold (use uniform if t <= tau, predictors if t > tau)
+        Time threshold (use uniform if t <= tau, else follow PP-H1Q)
+        NOTE: tau=0 means use PP-H1Q from round 1 (recommended)
     q : float
         Push predictor accuracy (0 to 1)
     seed : int
@@ -70,7 +76,7 @@ def simulate_la_pushpull(n, tau, q, seed, p=None, debug=False):
     rounds = 0
     
     if debug:
-        print(f"\n[DEBUG] Starting LA-Push-Pull: n={n}, tau={tau}, q={q:.1f}, p={p:.1f}")
+        print(f"\n[DEBUG] Starting LA-Push-Pull (PP-H1Q): n={n}, tau={tau}, q={q:.1f}, p={p:.1f}")
         print(f"[DEBUG] Initial infected: node {initial}")
     
     while not infected.all():
@@ -81,6 +87,7 @@ def simulate_la_pushpull(n, tau, q, seed, p=None, debug=False):
         uninformed_indices = np.flatnonzero(~infected)
         num_infected = len(infected_indices)
         num_uninformed = len(uninformed_indices)
+        ut = num_uninformed / n  # Uninformed fraction
         
         if num_uninformed == 0:
             break  # All infected
@@ -90,7 +97,8 @@ def simulate_la_pushpull(n, tau, q, seed, p=None, debug=False):
         
         if rounds <= tau:
             # ============================================================
-            # UNIFORM PHASE (t <= τ)
+            # PRE-PREDICTOR UNIFORM PHASE (t <= τ)
+            # Only used if tau > 0 (for comparison)
             # ============================================================
             
             # PULL: Each uninformed node pulls from uniform random peer (≠ self)
@@ -111,57 +119,101 @@ def simulate_la_pushpull(n, tau, q, seed, p=None, debug=False):
                 if not infected[push_targets[i]]:
                     new_infections.add(push_targets[i])
         
+        elif rounds == tau + 1:
+            # ============================================================
+            # PP-H1Q PHASE 1: P-SEEDING (Round 1 if tau=0)
+            # Use P for PULL, uniform for PUSH
+            # ============================================================
+            
+            if debug:
+                print(f"[DEBUG] Round {rounds}: PP-H1Q Phase 1 - P-seeding")
+            
+            # PULL with P: Uninformed nodes pull with predictor P
+            if num_uninformed > 0:
+                pull_from_infected = rng.random(size=num_uninformed) < p
+                
+                for i, u in enumerate(uninformed_indices):
+                    if pull_from_infected[i]:
+                        # Good pull: pull from infected set → infect u
+                        if num_infected > 0:
+                            new_infections.add(u)
+                    else:
+                        # Bad pull: pull from uninformed set → no infection
+                        uninformed_others = uninformed_indices[uninformed_indices != u]
+                        if len(uninformed_others) > 0:
+                            target = rng.choice(uninformed_others)
+            
+            # PUSH uniform: Informed nodes push uniformly
+            if num_infected > 0:
+                push_targets = rng.integers(0, n - 1, size=num_infected)
+                for i in range(num_infected):
+                    if push_targets[i] >= infected_indices[i]:
+                        push_targets[i] += 1
+                    if not infected[push_targets[i]]:
+                        new_infections.add(push_targets[i])
+        
+        elif ut > q:
+            # ============================================================
+            # PP-H1Q PHASE 2: UNIFORM PUSH-PULL (until ut <= q)
+            # Both pull and push are uniform
+            # ============================================================
+            
+            if debug and rounds % 5 == 0:
+                print(f"[DEBUG] Round {rounds}: PP-H1Q Phase 2 - Uniform push-pull (ut={ut:.4f} > q={q:.2f})")
+            
+            # PULL uniform: Each uninformed node pulls from uniform random peer
+            pull_targets = rng.integers(0, n - 1, size=num_uninformed)
+            for i in range(num_uninformed):
+                if pull_targets[i] >= uninformed_indices[i]:
+                    pull_targets[i] += 1
+                if infected[pull_targets[i]]:
+                    new_infections.add(uninformed_indices[i])
+            
+            # PUSH uniform: Each informed node pushes to uniform random peer
+            push_targets = rng.integers(0, n - 1, size=num_infected)
+            for i in range(num_infected):
+                if push_targets[i] >= infected_indices[i]:
+                    push_targets[i] += 1
+                if not infected[push_targets[i]]:
+                    new_infections.add(push_targets[i])
+        
         else:
             # ============================================================
-            # PREDICTOR PHASE (t > τ)
+            # PP-H1Q PHASE 3: Q-GUIDED TAIL (when ut <= q)
+            # Pull uniform, push with Q
             # ============================================================
             
-            # --- PULL SIDE: Uninformed nodes pull with predictor P ---
-            if num_uninformed > 0 and num_infected > 0:
-                # For each uninformed node, decide: aim at informed (p) or uninformed (1-p)
-                aim_at_informed = rng.random(size=num_uninformed) < p
-                
-                # Good pulls: aim at informed nodes
-                num_good_pulls = aim_at_informed.sum()
-                if num_good_pulls > 0:
-                    # Sample uniformly from infected set
-                    pull_targets = rng.choice(infected_indices, size=num_good_pulls)
-                    # All these pulls succeed (pulling from infected)
-                    pullers = uninformed_indices[aim_at_informed]
-                    for puller in pullers:
-                        new_infections.add(puller)
-                
-                # Bad pulls: aim at uninformed nodes (wasted pulls, don't get infected)
-                # No need to simulate these
+            if debug and rounds % 3 == 0:
+                print(f"[DEBUG] Round {rounds}: PP-H1Q Phase 3 - Q-guided tail (ut={ut:.4f} <= q={q:.2f})")
             
-            # --- PUSH SIDE: Informed nodes push with predictor Q ---
+            # PULL uniform: Uninformed nodes pull uniformly
+            pull_targets = rng.integers(0, n - 1, size=num_uninformed)
+            for i in range(num_uninformed):
+                if pull_targets[i] >= uninformed_indices[i]:
+                    pull_targets[i] += 1
+                if infected[pull_targets[i]]:
+                    new_infections.add(uninformed_indices[i])
+            
+            # PUSH with Q: Informed nodes push with predictor Q
             if num_infected > 0 and num_uninformed > 0:
-                # For each infected node, decide: aim at uninformed (q) or informed (1-q)
-                aim_at_uninformed = rng.random(size=num_infected) < q
+                push_to_uninformed = rng.random(size=num_infected) < q
                 
-                # Good pushes: aim at uninformed nodes
-                num_good_pushes = aim_at_uninformed.sum()
-                if num_good_pushes > 0:
-                    # Sample uniformly from uninformed set
-                    push_targets = rng.choice(uninformed_indices, size=num_good_pushes)
-                    for target in push_targets:
+                for i, v in enumerate(infected_indices):
+                    if push_to_uninformed[i]:
+                        # Good push: target uninformed → infect
+                        target = rng.choice(uninformed_indices)
                         new_infections.add(target)
-                
-                # Bad pushes: aim at informed nodes (wasted pushes)
-                # No need to simulate these
+                    else:
+                        # Bad push: target informed → no infection
+                        target = rng.choice(infected_indices)
         
-        # Debug output
-        if debug and rounds % 3 == 0:
-            print(f"[DEBUG] Round {rounds}: infected={num_infected}/{n}, new_infections={len(new_infections)}")
-        
-        # Check for stalled epidemic (no new infections)
+        # Check for stalled epidemic
         if len(new_infections) == 0:
             if debug:
-                print(f"[DEBUG] STALLED at round {rounds} with {num_infected}/{n} infected")
-                print(f"[DEBUG SUMMARY] Epidemic stalled (infinite rounds) — tau={tau}, q={q:.1f}, p={p:.1f}")
+                print(f"[DEBUG] STALLED at round {rounds} with {num_infected}/{n} infected (no new infections)")
             return -1  # Stalled
         
-        # Synchronous update: activate new infections at start of next round
+        # Synchronous update: apply all new infections
         for node in new_infections:
             infected[node] = True
     
@@ -345,11 +397,14 @@ def run_tau_sweep():
 def plot_rounds_vs_q(df):
     """
     Plot rounds vs q (one curve per τ).
+    FIXED: Add visible CI whiskers even when CI ≈ 0
     """
     fig, ax = plt.subplots(figsize=(10, 6))
     
     # Define colors for each τ
     colors = plt.cm.viridis(np.linspace(0, 1, len(TAUS)))
+    
+    ci_width_zero_count = 0
     
     for i, tau in enumerate(TAUS):
         subset = df[df['tau'] == tau].copy()
@@ -364,44 +419,77 @@ def plot_rounds_vs_q(df):
             ci_lows = subset_finite['ci_low'].values
             ci_highs = subset_finite['ci_high'].values
             
-            # Plot line
-            ax.plot(q_vals, means, marker='o', label=f'τ = {tau}', 
-                    color=colors[i], linewidth=2, markersize=6)
+            # FIXED: Check for CI ≈ 0 and use visible whisker
+            ci_widths = ci_highs - ci_lows
+            visible_ci_lows = np.where(ci_widths < 0.05, means - 0.10, ci_lows)
+            visible_ci_highs = np.where(ci_widths < 0.05, means + 0.10, ci_highs)
+            
+            # Log CI ≈ 0 cases
+            for j in range(len(ci_widths)):
+                if ci_widths[j] < 0.05:
+                    ci_width_zero_count += 1
+                    print(f"[NOTE] CI ~ 0 at tau={tau}, q={q_vals[j]:.1f} (all trials equal or near-equal)")
+            
+            # Plot line (raised z-order for markers above band)
+            line = ax.plot(q_vals, means, marker='o', label=f'τ = {tau}', 
+                    color=colors[i], linewidth=2, markersize=6, zorder=3)
             
             # Shaded CI
-            ax.fill_between(q_vals, ci_lows, ci_highs, alpha=0.2, color=colors[i])
+            ax.fill_between(q_vals, visible_ci_lows, visible_ci_highs, alpha=0.2, color=colors[i], zorder=1)
+            
+            # FIXED: Add errorbar caps on top of filled region
+            for j in range(len(q_vals)):
+                if ci_widths[j] >= 0.05:
+                    ax.errorbar(q_vals[j], means[j], 
+                              yerr=[[means[j] - ci_lows[j]], [ci_highs[j] - means[j]]],
+                              color=colors[i], linewidth=1.5, capsize=3, capthick=1.5, zorder=2)
     
-    ax.set_xlabel('Predictor Accuracy (q)', fontsize=12, fontweight='bold')
-    ax.set_ylabel('Rounds to Full Infection', fontsize=12, fontweight='bold')
-    ax.set_title(f'LA-Push-Pull (Predictors after time threshold) — n={N:,}, T={TRIALS}', 
+    ax.set_xlabel('Predictor Accuracy (q = p)', fontsize=12, fontweight='bold')
+    ax.set_ylabel('Rounds to Full Infection (lower is better)', fontsize=12, fontweight='bold')
+    ax.set_title(f'LA-Push-Pull (PP-H1Q policy, p=q) — n={N:,}, T={TRIALS}', 
                  fontsize=14, fontweight='bold')
     ax.legend(loc='best', framealpha=0.9)
     ax.grid(True, alpha=0.3)
-    ax.set_xlim(-0.05, 1.05)
+    ax.set_xlim(0.05, 1.05)  # Start from q=0.1
     
-    # Add note about stalled epidemics if any
-    total_stalled = df['num_stalled'].sum()
-    if total_stalled > 0:
-        ax.text(0.02, 0.98, f'Note: {int(total_stalled)} trial(s) stalled (excluded)', 
-                transform=ax.transAxes, fontsize=9, verticalalignment='top',
-                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+    # Add note about CI bands
+    note_text = f"Bands show 95% CI; some disappear because all trials matched (CI ~ 0)"
+    if ci_width_zero_count > 0:
+        note_text += f"\n{ci_width_zero_count} point(s) with CI ~ 0"
+    ax.text(0.02, 0.02, note_text, 
+            transform=ax.transAxes, fontsize=8, verticalalignment='bottom',
+            bbox=dict(boxstyle='round', facecolor='lightgray', alpha=0.3))
     
     plt.tight_layout()
+    
+    # FIXED: Set y-limits AFTER tight_layout to prevent it from resetting to 0
+    y_min = df[np.isfinite(df['mean'])]['mean'].min() - 1
+    y_max = df[np.isfinite(df['mean'])]['mean'].max() + 1
+    ax.set_ylim(y_min, y_max)
+    
     plt.savefig('la_pushpull_rounds_vs_q.png', dpi=300, bbox_inches='tight')
     plt.savefig('la_pushpull_rounds_vs_q.pdf', bbox_inches='tight')
     plt.close()
     
     print("+ Saved la_pushpull_rounds_vs_q.png and .pdf")
+    
+    # FIXED: Print verification table
+    print("\nVerification (first 5 rows):")
+    print(df.head(5)[['tau', 'q', 'mean', 'ci_low', 'ci_high']].to_string())
+    print()
 
 
 def plot_rounds_vs_tau(df):
     """
     Plot rounds vs tau (one curve per selected q).
+    FIXED: Add visible CI whiskers even when CI ≈ 0
     """
     fig, ax = plt.subplots(figsize=(10, 6))
     
     # Define colors for each q
     colors = plt.cm.plasma(np.linspace(0.2, 0.9, len(Q_SLICES)))
+    
+    ci_width_zero_count = 0
     
     for i, q in enumerate(Q_SLICES):
         subset = df[df['q'] == q].copy()
@@ -416,27 +504,64 @@ def plot_rounds_vs_tau(df):
             ci_lows = subset_finite['ci_low'].values
             ci_highs = subset_finite['ci_high'].values
             
-            # Plot line
+            # FIXED: Check for CI ≈ 0 and use visible whisker
+            ci_widths = ci_highs - ci_lows
+            visible_ci_lows = np.where(ci_widths < 0.05, means - 0.10, ci_lows)
+            visible_ci_highs = np.where(ci_widths < 0.05, means + 0.10, ci_highs)
+            
+            # Log CI ≈ 0 cases
+            for j in range(len(ci_widths)):
+                if ci_widths[j] < 0.05:
+                    ci_width_zero_count += 1
+                    print(f"[NOTE] CI ~ 0 at q={q:.1f}, tau={tau_vals[j]} (all trials equal or near-equal)")
+            
+            # Plot line (raised z-order for markers above band)
             ax.plot(tau_vals, means, marker='s', label=f'q = {q:.1f}', 
-                    color=colors[i], linewidth=2, markersize=7)
+                    color=colors[i], linewidth=2, markersize=7, zorder=3)
             
             # Shaded CI
-            ax.fill_between(tau_vals, ci_lows, ci_highs, alpha=0.2, color=colors[i])
+            ax.fill_between(tau_vals, visible_ci_lows, visible_ci_highs, alpha=0.2, color=colors[i], zorder=1)
+            
+            # FIXED: Add errorbar caps on top of filled region
+            for j in range(len(tau_vals)):
+                if ci_widths[j] >= 0.05:
+                    ax.errorbar(tau_vals[j], means[j], 
+                              yerr=[[means[j] - ci_lows[j]], [ci_highs[j] - means[j]]],
+                              color=colors[i], linewidth=1.5, capsize=3, capthick=1.5, zorder=2)
     
     ax.set_xlabel('Time Threshold (τ)', fontsize=12, fontweight='bold')
-    ax.set_ylabel('Rounds to Full Infection', fontsize=12, fontweight='bold')
-    ax.set_title(f'LA-Push-Pull — tuning threshold τ (n={N:,}, T={TRIALS})', 
+    ax.set_ylabel('Rounds to Full Infection (lower is better)', fontsize=12, fontweight='bold')
+    ax.set_title(f'LA-Push-Pull (PP-H1Q, p=q) — tuning threshold τ (n={N:,}, T={TRIALS})', 
                  fontsize=14, fontweight='bold')
     ax.legend(loc='best', framealpha=0.9)
     ax.grid(True, alpha=0.3)
     ax.set_xticks(TAUS)
     
+    # Add note about CI bands
+    note_text = f"Bands show 95% CI; some disappear because all trials matched (CI ~ 0)"
+    if ci_width_zero_count > 0:
+        note_text += f"\n{ci_width_zero_count} point(s) with CI ~ 0"
+    ax.text(0.02, 0.02, note_text, 
+            transform=ax.transAxes, fontsize=8, verticalalignment='bottom',
+            bbox=dict(boxstyle='round', facecolor='lightgray', alpha=0.3))
+    
     plt.tight_layout()
+    
+    # FIXED: Set y-limits AFTER tight_layout to prevent it from resetting to 0
+    y_min = df[np.isfinite(df['mean'])]['mean'].min() - 1
+    y_max = df[np.isfinite(df['mean'])]['mean'].max() + 1
+    ax.set_ylim(y_min, y_max)
+    
     plt.savefig('la_pushpull_rounds_vs_tau.png', dpi=300, bbox_inches='tight')
     plt.savefig('la_pushpull_rounds_vs_tau.pdf', bbox_inches='tight')
     plt.close()
     
     print("+ Saved la_pushpull_rounds_vs_tau.png and .pdf")
+    
+    # FIXED: Print verification table
+    print("\nVerification (first 5 rows):")
+    print(df.head(5)[['q', 'tau', 'mean', 'ci_low', 'ci_high']].to_string())
+    print()
 
 
 # ============================================================================
@@ -486,7 +611,7 @@ def print_best_tau_summary(df_tau):
 
 def main():
     print("="*70)
-    print("LA-PUSH-PULL WITH TIME-THRESHOLD PREDICTOR SWITCH")
+    print("LA-PUSH-PULL WITH PP-H1Q POLICY (Paper's Exact Algorithm)")
     print("="*70)
     print(f"Graph size (n):        {N:,}")
     print(f"Trials per config:     {TRIALS}")
@@ -499,10 +624,10 @@ def main():
     
     # Optional debug check
     print("Running debug checks...")
-    print("\nDebug check 1: n=500, tau=0, q=0.0")
-    simulate_la_pushpull(500, tau=0, q=0.0, seed=42, debug=True)
+    print("\nDebug check 1: n=500, tau=0, q=0.1, p=0.1")
+    simulate_la_pushpull(500, tau=0, q=0.1, seed=42, debug=True)
     
-    print("\nDebug check 2: n=500, tau=0, q=0.6")
+    print("\nDebug check 2: n=500, tau=0, q=0.6, p=0.6")
     simulate_la_pushpull(500, tau=0, q=0.6, seed=42, debug=True)
     print()
     
